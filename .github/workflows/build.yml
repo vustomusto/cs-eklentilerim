@@ -23,20 +23,17 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Android SDK Kurulumu
-        uses: android-actions/setup-android@v3
-
-      - name: Gradle 8.7 Kurulumu ve Derleme
+      - name: Gradle Kurulumu ve Derleme
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-          arguments: make makePluginsJson
+          arguments: make makePluginsJson --stacktrace
 
       - name: Çıktıları Hazırla
         run: |
           mkdir -p build_output
-          cp MultiStream/build/MultiStream.cs3 build_output/
-          cp build/plugins.json build_output/
+          find . -name "*.cs3" -exec cp {} build_output/ \;
+          find . -name "plugins.json" -exec cp {} build_output/ \;
           cp repo.json build_output/
 
       - name: Builds Dalına Gönder (Deploy)
