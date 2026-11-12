@@ -1,0 +1,24 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=framextv.cc&sz=%size%",
+        "fileHash": "sha256-805544603a67d57e3e4a0d568a561618f26ada40e6f0ee82f966b83861cff3a6",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/vustomusto/cs-eklentilerim",
+        "fileSize": 40164,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Mustafa"
+        ],
+        "tvTypes": [
+            "TvSeries",
+            "Movie",
+            "Anime"
+        ],
+        "version": 7,
+        "internalName": "MultiStream",
+        "description": "Dizipal (Otomatik Adres) ve FrameXTV (TMDB Multi-Server) Eklentisi",
+        "url": "https://raw.githubusercontent.com/vustomusto/cs-eklentilerim/builds/MultiStream.cs3",
+        "name": "MultiStream"
+    }
+]
