@@ -21,7 +21,7 @@ class Dizipal : MainAPI() {
     private val cloudflareKiller by lazy { CloudflareKiller() }
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
     )
@@ -30,7 +30,8 @@ class Dizipal : MainAPI() {
         val response = app.get(
             url,
             headers = defaultHeaders,
-            referer = referer ?: "$mainUrl/"
+            referer = referer ?: "$mainUrl/",
+            timeout = 8L
         )
 
         if (response.code in listOf(403, 503) || response.text.contains("Just a moment", ignoreCase = true)) {
@@ -38,25 +39,43 @@ class Dizipal : MainAPI() {
                 url,
                 headers = defaultHeaders,
                 referer = referer ?: "$mainUrl/",
-                interceptor = cloudflareKiller
+                interceptor = cloudflareKiller,
+                timeout = 15L
             ).document
         }
 
         return response.document
     }
 
+    /**
+     * Sadece HTTP 200 dönmesine değil, sayfa içinde gerçekten dizi/film/bölüm
+     * bağlantıları olup olmadığına bakarak aktif adresi doğrular.
+     */
     private suspend fun getActiveUrl(): String {
         resolvedUrl?.let { return it }
 
         val startNumber = 2149
-        val maxTries = 20
+        val maxTries = 35 // 2149 - 2184 arası kontrol eder
 
         for (i in 0..maxTries) {
             val testDomain = "https://dizipal${startNumber + i}.com"
             try {
-                val response = app.get(testDomain, headers = defaultHeaders)
-                if (response.code in 200..399 || response.text.contains("dizipal", ignoreCase = true)) {
-                    val finalUrl = response.url.trimEnd('/')
+                val response = app.get(testDomain, headers = defaultHeaders, timeout = 4L)
+                val doc = if (response.code in listOf(403, 503)) {
+                    app.get(testDomain, headers = defaultHeaders, interceptor = cloudflareKiller, timeout = 10L).document
+                } else {
+                    response.document
+                }
+
+                // Sayfada gerçek içerik kartları veya bağlantıları var mı kontrol et
+                val hasContent = doc.select(
+                    "div.episode-item, article.type2, a[href*='/dizi/'], a[href*='/film/'], a[href*='bolum'], div.poster, article"
+                ).size > 2
+
+                if (hasContent) {
+                    val finalUrl = response.url.trimEnd('/').let {
+                        if (it.startsWith("http")) it.substringBefore("/dizi").substringBefore("/film") else testDomain
+                    }
                     resolvedUrl = finalUrl
                     mainUrl = finalUrl
                     return finalUrl
@@ -69,50 +88,133 @@ class Dizipal : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
+        "" to "Son Eklenenler (Ana Sayfa)",
         "/diziler/son-bolumler" to "Son Bölümler",
         "/diziler" to "Yeni Diziler",
         "/filmler" to "Yeni Filmler",
         "/koleksiyon/netflix" to "Netflix İçerikleri",
-        "/koleksiyon/exxen" to "Exxen İçerikleri",
-        "/koleksiyon/blutv" to "BluTV İçerikleri"
+        "/koleksiyon/exxen" to "Exxen İçerikleri"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val baseUrl = getActiveUrl()
-        val url = if (page == 1) {
-            "$baseUrl${request.data}"
-        } else {
-            val separator = if (request.data.contains("?")) "&" else "?"
-            "$baseUrl${request.data}${separator}page=$page"
+        val path = request.data
+        val url = when {
+            path.isEmpty() && page == 1 -> baseUrl
+            path.isEmpty() && page > 1 -> return newHomePageResponse(request.name, emptyList())
+            page == 1 -> "$baseUrl$path"
+            else -> {
+                val sep = if (path.contains("?")) "&" else "?"
+                "$baseUrl$path${sep}page=$page"
+            }
         }
 
-        val document = getDocumentWithCf(url, baseUrl)
-
-        val items = document.select(
-            "div.episode-item, article.type2 ul li, div.type2 ul li, li.w-item, article.movie-item, div.series-item"
-        ).mapNotNull { element ->
-            element.toMainPageResult(baseUrl)
+        val document = try {
+            getDocumentWithCf(url, baseUrl)
+        } catch (e: Exception) {
+            return newHomePageResponse(request.name, emptyList())
         }
 
+        val items = extractItemsFromDocument(document, baseUrl)
         return newHomePageResponse(request.name, items)
     }
 
-    private fun Element.toMainPageResult(baseUrl: String): SearchResponse? {
-        val seriesTitle = this.selectFirst("div.name, span.title, h2, div.title")?.text()?.trim()
-        val epTitle = this.selectFirst("div.episode, span.episode")?.text()?.trim()
+    /**
+     * Hem klasik Dizipal temasını hem de yeni nesil klon temaları
+     * tarayan çok katmanlı içerik çıkarıcı.
+     */
+    private fun extractItemsFromDocument(document: Document, baseUrl: String): List<SearchResponse> {
+        val results = mutableListOf<SearchResponse>()
+        val seenUrls = mutableSetOf<String>()
 
-        val fullTitle = when {
-            seriesTitle != null && epTitle != null -> "$seriesTitle - $epTitle"
-            seriesTitle != null -> seriesTitle
-            else -> this.selectFirst("a")?.attr("title")?.trim() ?: return null
+        // 1. Katman: Bilinen tüm kart seçicileri
+        val cardElements = document.select(
+            "div.episode-item, article.type2 ul li, div.type2 ul li, li.w-item, " +
+            "article.movie-item, div.series-item, div.poster, div.grid-box, " +
+            "div.flw-item, article.item, div.item, article"
+        )
+
+        cardElements.forEach { element ->
+            element.toMainPageResult(baseUrl)?.let { item ->
+                if (seenUrls.add(item.url)) {
+                    results.add(item)
+                }
+            }
         }
 
-        val rawHref = this.selectFirst("a")?.attr("href") ?: return null
+        // 2. Katman (Evrensel Yedek): Eğer tema değişmişse ve 1. katman boş döndüyse,
+        // içinde resim (poster) barındıran tüm dizi/film/bölüm linklerini yakala
+        if (results.isEmpty()) {
+            document.select("a[href]").forEach { aTag ->
+                val rawHref = aTag.attr("href")
+                if (rawHref.isEmpty() || rawHref.startsWith("#") || rawHref.contains("javascript")) return@forEach
+
+                val isContentLink = rawHref.contains("/dizi/") ||
+                        rawHref.contains("/film/") ||
+                        rawHref.contains("bolum") ||
+                        rawHref.contains("sezon") ||
+                        rawHref.contains("/watch/") ||
+                        rawHref.contains("/izle/")
+
+                val img = aTag.selectFirst("img") ?: aTag.parent()?.selectFirst("img")
+                if (!isContentLink && img == null) return@forEach
+
+                val fullUrl = fixUrlWithBase(rawHref, baseUrl)
+                if (fullUrl == baseUrl || fullUrl == "$baseUrl/") return@forEach
+
+                val title = aTag.attr("title").trim().ifEmpty {
+                    img?.attr("alt")?.trim().orEmpty().ifEmpty {
+                        aTag.text().trim().ifEmpty {
+                            aTag.parent()?.selectFirst("h2, h3, h4, span.title, div.name")?.text()?.trim().orEmpty()
+                        }
+                    }
+                }
+
+                if (title.length < 2 || title.lowercase() in listOf("anasayfa", "diziler", "filmler", "giriş", "kayıt")) {
+                    return@forEach
+                }
+
+                val poster = fixUrlNull(
+                    img?.attr("data-src")?.ifEmpty { null }
+                        ?: img?.attr("data-lazy-src")?.ifEmpty { null }
+                        ?: img?.attr("src")
+                )
+
+                if (seenUrls.add(fullUrl)) {
+                    val isMovie = fullUrl.contains("/film/") || fullUrl.contains("/movie")
+                    if (isMovie) {
+                        results.add(newMovieSearchResponse(title, fullUrl, TvType.Movie) { this.posterUrl = poster })
+                    } else {
+                        results.add(newTvSeriesSearchResponse(title, fullUrl, TvType.TvSeries) { this.posterUrl = poster })
+                    }
+                }
+            }
+        }
+
+        return results
+    }
+
+    private fun Element.toMainPageResult(baseUrl: String): SearchResponse? {
+        val aTag = if (this.tagName() == "a") this else this.selectFirst("a[href]") ?: return null
+        val rawHref = aTag.attr("href").takeIf { it.isNotEmpty() && !it.startsWith("#") } ?: return null
         val href = fixUrlWithBase(rawHref, baseUrl)
 
         val imgElement = this.selectFirst("img")
+        val seriesTitle = this.selectFirst("div.name, span.title, h2, h3, h4, div.title, span.name")?.text()?.trim()
+            ?: aTag.attr("title").trim().ifEmpty { null }
+            ?: imgElement?.attr("alt")?.trim()?.ifEmpty { null }
+
+        val epTitle = this.selectFirst("div.episode, span.episode, span.ep")?.text()?.trim()
+
+        val fullTitle = when {
+            seriesTitle != null && epTitle != null && !seriesTitle.contains(epTitle) -> "$seriesTitle -$epTitle"
+            seriesTitle != null -> seriesTitle
+            else -> aTag.text().trim().takeIf { it.length > 1 } ?: return null
+        }
+
         val posterUrl = fixUrlNull(
             imgElement?.attr("data-src")?.ifEmpty { null }
+                ?: imgElement?.attr("data-lazy-src")?.ifEmpty { null }
                 ?: imgElement?.attr("src")
         )
 
@@ -169,28 +271,23 @@ class Dizipal : MainAPI() {
             }
 
             val doc = Jsoup.parse(responseText)
-            doc.select("a").forEach { aTag ->
-                val title = aTag.selectFirst("span.title, div.title, span")?.text()?.trim() ?: aTag.text().trim()
-                val href = aTag.attr("href").takeIf { it.isNotEmpty() }?.let { fixUrlWithBase(it, baseUrl) } ?: return@forEach
-                val poster = fixUrlNull(aTag.selectFirst("img")?.attr("src"))
-                val isMovie = href.contains("/film/")
-
-                if (title.isNotEmpty()) {
-                    if (isMovie) {
-                        results.add(newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster })
-                    } else {
-                        results.add(newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster })
-                    }
-                }
-            }
+            results.addAll(extractItemsFromDocument(doc, baseUrl))
         } catch (e: Exception) {
-            // Yedek aramaya geç
+            // Standart aramaya geç
         }
 
         if (results.isEmpty()) {
-            val searchDoc = getDocumentWithCf("$baseUrl/arama?q=$query", baseUrl)
-            searchDoc.select("article.type2 ul li, div.episode-item, li.w-item").mapNotNullTo(results) {
-                it.toMainPageResult(baseUrl)
+            for (searchPath in listOf("/arama?q=$query", "/?s=$query", "/search?q=$query")) {
+                try {
+                    val searchDoc = getDocumentWithCf("$baseUrl$searchPath", baseUrl)
+                    val items = extractItemsFromDocument(searchDoc, baseUrl)
+                    if (items.isNotEmpty()) {
+                        results.addAll(items)
+                        break
+                    }
+                } catch (e: Exception) {
+                    continue
+                }
             }
         }
 
@@ -202,9 +299,10 @@ class Dizipal : MainAPI() {
         var targetUrl = url
         var document = getDocumentWithCf(targetUrl, baseUrl)
 
-        if (targetUrl.contains("-bolum") || targetUrl.contains("/sezon-")) {
-            val seriesPageHref = document.selectFirst("div.series-info a, a.series-title, div.top-content a[href*='/dizi/']")
-                ?.attr("href")
+        if (targetUrl.contains("bolum") || targetUrl.contains("sezon")) {
+            val seriesPageHref = document.selectFirst(
+                "div.series-info a, a.series-title, div.top-content a[href*='/dizi/'], a[href*='/dizi/']"
+            )?.attr("href")
             if (seriesPageHref != null) {
                 targetUrl = fixUrlWithBase(seriesPageHref, baseUrl)
                 document = getDocumentWithCf(targetUrl, baseUrl)
@@ -212,40 +310,46 @@ class Dizipal : MainAPI() {
         }
 
         val title = document.selectFirst(
-            "div.cover h5, div.series-title h1, div.top-content h1, h1.title, h1"
-        )?.text()?.trim() ?: return null
+            "div.cover h5, div.series-title h1, div.top-content h1, h1.title, h1, h2.title"
+        )?.text()?.trim()
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.substringBefore("-")?.trim()
+            ?: return null
 
         val poster = fixUrlNull(
-            document.selectFirst("div.cover img, div.poster img")?.attr("data-src")?.ifEmpty { null }
-                ?: document.selectFirst("div.cover img, div.poster img")?.attr("src")
+            document.selectFirst("div.cover img, div.poster img, div.series-poster img")?.attr("data-src")?.ifEmpty { null }
+                ?: document.selectFirst("div.cover img, div.poster img, div.series-poster img")?.attr("src")
                 ?: document.selectFirst("meta[property=og:image]")?.attr("content")
         )
 
-        val description = document.selectFirst("div.summary p, div.series-summary p, div.summary")?.text()?.trim()
-        val year = document.select("div.col-md-6 div, ul.extra-info li")
-            .firstOrNull { it.text().contains("Yapım Yılı", ignoreCase = true) }
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
+        val description = document.selectFirst("div.summary p, div.series-summary p, div.summary, meta[property=og:description]")
+            ?.let { if (it.tagName() == "meta") it.attr("content") else it.text() }?.trim()
 
-        val tags = document.select("div.genres a, ul.genres li a").map { it.text().trim() }
+        val episodes = mutableListOf<Episode>()
+        val seenEpUrls = mutableSetOf<String>()
 
-        val episodes = document.select("div.episode-item, div.bolumler a, ul.episodes-list li").mapNotNull { ep ->
-            val aTag = if (ep.tagName() == "a") ep else ep.selectFirst("a")
-            val epHref = aTag?.attr("href")?.let { fixUrlWithBase(it, baseUrl) } ?: return@mapNotNull null
+        document.select("div.episode-item, div.bolumler a, ul.episodes-list li, a[href*='bolum'], a[href*='sezon']").forEach { ep ->
+            val aTag = if (ep.tagName() == "a") ep else ep.selectFirst("a[href]") ?: return@forEach
+            val epHref = aTag.attr("href").takeIf { it.isNotEmpty() && !it.startsWith("#") }
+                ?.let { fixUrlWithBase(it, baseUrl) } ?: return@forEach
+
+            if (!seenEpUrls.add(epHref)) return@forEach
 
             val epTitle = ep.selectFirst("div.name, span.ep-title, div.title")?.text()?.trim()
                 ?: aTag.text().trim().ifEmpty { "Bölüm" }
 
-            val epNumText = ep.selectFirst("div.episode, span.episode")?.text() ?: epHref
+            val epNumText = "${ep.text()}$epHref"
             val seasonNum = Regex("""(\d+)\.\s*Sezon|sezon-(\d+)""", RegexOption.IGNORE_CASE)
                 .find(epNumText)?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }?.toIntOrNull()
             val episodeNum = Regex("""(\d+)\.\s*Bölüm|bolum-(\d+)""", RegexOption.IGNORE_CASE)
                 .find(epNumText)?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }?.toIntOrNull()
 
-            newEpisode(epHref) {
-                this.name = epTitle
-                this.season = seasonNum
-                this.episode = episodeNum
-            }
+            episodes.add(
+                newEpisode(epHref) {
+                    this.name = epTitle
+                    this.season = seasonNum
+                    this.episode = episodeNum
+                }
+            )
         }
 
         val isMovie = episodes.isEmpty() || targetUrl.contains("/film/")
@@ -254,15 +358,11 @@ class Dizipal : MainAPI() {
             newMovieLoadResponse(title, targetUrl, TvType.Movie, targetUrl) {
                 this.posterUrl = poster
                 this.plot = description
-                this.year = year
-                this.tags = tags
             }
         } else {
             newTvSeriesLoadResponse(title, targetUrl, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot = description
-                this.year = year
-                this.tags = tags
             }
         }
     }
@@ -276,9 +376,11 @@ class Dizipal : MainAPI() {
         val baseUrl = getActiveUrl()
         val document = getDocumentWithCf(data, baseUrl)
 
-        val iframeUrl = document.selectFirst(
-            "div#vast_new iframe, div.series-player-container iframe, div.player-container iframe, iframe[src*='player'], iframe"
-        )?.attr("src")?.takeIf { it.isNotEmpty() }?.let { fixUrlWithBase(it, baseUrl) } ?: return false
+        val iframeElement = document.selectFirst(
+            "div#vast_new iframe, div.series-player-container iframe, div.player-container iframe, iframe[src*='player'], iframe[src*='embed'], iframe[data-src], iframe"
+        )
+        val rawIframe = iframeElement?.attr("data-src")?.ifEmpty { null } ?: iframeElement?.attr("src")
+        val iframeUrl = rawIframe?.takeIf { it.isNotEmpty() }?.let { fixUrlWithBase(it, baseUrl) } ?: data
 
         var foundLinks = false
 
@@ -291,25 +393,18 @@ class Dizipal : MainAPI() {
 
             val subRegex = Regex("""\[([^\]]+)\](https?://[^\s"',]+\.vtt)""")
             subRegex.findAll(iframeResponse).forEach { match ->
-                val subLang = match.groupValues[1]
-                val subUrl = match.groupValues[2]
-                subtitleCallback(SubtitleFile(subLang, subUrl))
+                subtitleCallback(SubtitleFile(match.groupValues[1], match.groupValues[2]))
             }
 
-            val m3u8Regex = Regex("""(?:file|source)\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
-            val m3u8Url = m3u8Regex.find(iframeResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+            val m3u8Regex = Regex("""(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)""")
+            val m3u8Url = m3u8Regex.find(iframeResponse.replace("\\/", "/"))?.groupValues?.get(1)
 
             if (!m3u8Url.isNullOrEmpty()) {
-                M3u8Helper.generateM3u8(
-                    source = name,
-                    streamUrl = m3u8Url,
-                    referer = iframeUrl,
-                    headers = mapOf("Origin" to baseUrl)
-                ).forEach(callback)
+                emitM3u8(name, m3u8Url, iframeUrl, baseUrl, callback)
                 foundLinks = true
             }
         } catch (e: Exception) {
-            // 2. aşamaya geç
+            // WebView aşamasına geç
         }
 
         if (!foundLinks) {
@@ -318,28 +413,60 @@ class Dizipal : MainAPI() {
                     iframeUrl,
                     referer = data,
                     interceptor = WebViewResolver(
-                        interceptUrl = Regex("""\.m3u8(\?|$)"""),
-                        additionalUrls = listOf(Regex("""\.vtt(\?|$)"""))
+                        interceptUrl = Regex("""(\.m3u8|\.mp4|master\.txt|/playlist/)"""),
+                        additionalUrls = listOf(Regex("""\.vtt"""))
                     )
                 )
-                if (resolved.url.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(
-                        source = "$name (WebView)",
-                        streamUrl = resolved.url,
-                        referer = iframeUrl
-                    ).forEach(callback)
+                if (resolved.url != iframeUrl) {
+                    emitM3u8("$name (WebView)", resolved.url, iframeUrl, baseUrl, callback)
                     foundLinks = true
                 }
             } catch (e: Exception) {
-                // 3. aşamaya geç
+                // Extractor aşamasına geç
             }
         }
 
-        if (!foundLinks) {
+        if (!foundLinks && iframeUrl != data) {
             loadExtractor(iframeUrl, data, subtitleCallback, callback)
         }
 
         return true
+    }
+
+    private suspend fun emitM3u8(
+        sourceName: String,
+        streamUrl: String,
+        refererUrl: String,
+        originUrl: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val generated = try {
+            M3u8Helper.generateM3u8(
+                source = sourceName,
+                streamUrl = streamUrl,
+                referer = refererUrl,
+                headers = mapOf("Origin" to originUrl)
+            )
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        if (generated.isNotEmpty()) {
+            generated.forEach(callback)
+        } else {
+            callback.invoke(
+                newExtractorLink(
+                    source = sourceName,
+                    name = sourceName,
+                    url = streamUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = refererUrl
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("Origin" to originUrl)
+                }
+            )
+        }
     }
 
     private fun fixUrlWithBase(url: String, baseDomain: String): String {
