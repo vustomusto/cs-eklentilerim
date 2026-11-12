@@ -15,7 +15,8 @@ class FrameXTV : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val tmdbApi = "https://api.themoviedb.org/3"
-    private val apiKey = "8d6d91941230817f7807d643736e8a49"
+    // Çalıştığı doğrulanan aktif TMDB API anahtarı
+    private val apiKey = "62618fc620c9eede1546f6aa3f8b3a15"
     private val imageBase = "https://image.tmdb.org/t/p/w500"
 
     private val browserHeaders = mapOf(
@@ -35,7 +36,14 @@ class FrameXTV : MainAPI() {
         val isTv = request.data.contains("/tv")
         val url = "$tmdbApi${request.data}?api_key=$apiKey&language=tr-TR&page=$page"
         val responseText = app.get(url, headers = browserHeaders).text
-        val results = parseTmdbList(responseText, isTv)
+        var results = parseTmdbList(responseText, isTv)
+
+        // Türkçe liste boş dönerse İngilizce yedek listeyi çek
+        if (results.isEmpty()) {
+            val fallbackUrl = "$tmdbApi${request.data}?api_key=$apiKey&language=en-US&page=$page"
+            results = parseTmdbList(app.get(fallbackUrl, headers = browserHeaders).text, isTv)
+        }
+
         return newHomePageResponse(request.name, results)
     }
 
@@ -46,10 +54,9 @@ class FrameXTV : MainAPI() {
         val results = mutableListOf<SearchResponse>()
         val seen = mutableSetOf<String>()
 
-        // Hem Türkçe hem İngilizce başlıkları kapsamak için sırayla ara
         val urls = listOf(
-            "$tmdbApi/search/multi?api_key=$apiKey&language=tr-TR&query=$encoded&page=1&include_adult=false",
-            "$tmdbApi/search/multi?api_key=$apiKey&language=en-US&query=$encoded&page=1&include_adult=false"
+            "$tmdbApi/search/multi?api_key=$apiKey&language=tr-TR&query=$encoded&page=1",
+            "$tmdbApi/search/multi?api_key=$apiKey&language=en-US&query=$encoded&page=1"
         )
 
         for (u in urls) {
@@ -105,7 +112,7 @@ class FrameXTV : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            // JSON hatası olursa boş dön
+            // Hata durumunda boş dön
         }
         return list
     }
@@ -122,7 +129,7 @@ class FrameXTV : MainAPI() {
         val title = (if (isTv) detailJson.optString("name") else detailJson.optString("title"))
             .takeIf { it.isNotEmpty() && it != "null" }
             ?: detailJson.optString("original_name").takeIf { it.isNotEmpty() && it != "null" }
-            ?: detailJson.optString("original_title")
+            ?: detailJson.optString("original_title").ifEmpty { "İçerik #$tmdbId" }
 
         val overview = detailJson.optString("overview").takeIf { it.isNotEmpty() && it != "null" }
         val posterPath = detailJson.optString("poster_path").takeIf { it.isNotEmpty() && it != "null" }
@@ -151,7 +158,6 @@ class FrameXTV : MainAPI() {
             val seasonsArray = detailJson.optJSONArray("seasons")
 
             if (seasonsArray != null) {
-                // Hızlı yükleme için her sezonun bölüm sayısını doğrudan ana JSON'dan oluştur
                 for (i in 0 until seasonsArray.length()) {
                     val sObj = seasonsArray.optJSONObject(i) ?: continue
                     val seasonNum = sObj.optInt("season_number", 0)
@@ -211,7 +217,7 @@ class FrameXTV : MainAPI() {
         }
         extractVixsrc(vixUrl, callback)
 
-        // 2. CloudStream Yerleşik Hızlı Çözücüler (VidSrc, VidSrcTo, AutoEmbed)
+        // 2. CloudStream Yerleşik Hızlı Çözücüler
         val embedUrls = mutableListOf<String>()
         if (isTv) {
             embedUrls.add("https://vidsrc.xyz/embed/tv?tmdb=$tmdbId&season=$season&episode=$episode")
@@ -287,7 +293,6 @@ class FrameXTV : MainAPI() {
         try {
             val html = app.get(url, headers = browserHeaders, referer = "https://vixsrc.to/", timeout = 8L).text.replace("\\/", "/")
 
-            // Yöntem A: window.masterPlaylist (url + token + expires)
             val playlistUrl = Regex("""url\s*:\s*['"](https?://[^'"]+/playlist/[^'"]+)['"]""")
                 .find(html)?.groupValues?.get(1)
             val token = Regex("""['"]?token['"]?\s*:\s*['"]([^'"]+)['"]""")
@@ -302,7 +307,6 @@ class FrameXTV : MainAPI() {
                 return
             }
 
-            // Yöntem B: Doğrudan m3u8 linki varsa
             val directM3u8 = Regex("""(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)""").find(html)?.groupValues?.get(1)
             if (directM3u8 != null) {
                 emitDirectStream("FrameXTV - Goblin III", directM3u8, url, "https://vixsrc.to", callback)
