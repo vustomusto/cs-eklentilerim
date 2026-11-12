@@ -1,0 +1,48 @@
+name: Build CloudStream Plugins
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Depoyu Çek (Checkout)
+        uses: actions/checkout@v4
+
+      - name: JDK 17 Kurulumu
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Android SDK Kurulumu
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle 8.7 Kurulumu ve Derleme
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+          arguments: make makePluginsJson
+
+      - name: Çıktıları Hazırla
+        run: |
+          mkdir -p build_output
+          cp MultiStream/build/MultiStream.cs3 build_output/
+          cp build/plugins.json build_output/
+          cp repo.json build_output/
+
+      - name: Builds Dalına Gönder (Deploy)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: builds
+          publish_dir: ./build_output
+          force_orphan: true
