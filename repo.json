@@ -1,0 +1,8 @@
+{
+  "name": "Özel CloudStream Depom",
+  "description": "Dizipal ve FrameXTV Eklenti Paketi",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/vustomusto/cs-eklentilerim/builds/plugins.json"
+  ]
+}
