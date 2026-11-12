@@ -1,4 +1,4 @@
-version = 6
+version = 7
 
 cloudstream {
     description = "Dizipal (Otomatik Adres) ve FrameXTV (TMDB Multi-Server) Eklentisi"
